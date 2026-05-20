@@ -106,18 +106,48 @@ grafana_monitoring_mikrotik/
 ├── snmp-exporter/
 │   └── snmp.yml
 ├── grafana/
+│   ├── data/
+│   │   └── grafana.db
+│   ├── dashboards/
+│   │   └── dashboard-mikrotik.json
 │   └── provisioning/
 │       ├── datasources/
+│       │   └── prometheus.yml
 │       └── dashboards/
+│           └── mikrotik-dashboard.yml
+├── hasil/
+│   ├── grafana_proses.png
+│   ├── prometheus_targets_job.png
+│   └── wujud_asli_mikrotik.jpeg
+├── penjelasan_dari_awal.md
 └── README.md
 ```
 
-Untuk tahap awal, file yang wajib ada:
+File yang wajib ada untuk menjalankan stack:
 
 ```text
 docker-compose.yml
 prometheus/prometheus.yml
 snmp-exporter/snmp.yml
+```
+
+File/folder penting untuk menjaga tampilan Grafana tetap aman saat pindah device:
+
+```text
+grafana/data/grafana.db
+grafana/provisioning/datasources/prometheus.yml
+grafana/provisioning/dashboards/mikrotik-dashboard.yml
+grafana/dashboards/dashboard-mikrotik.json
+```
+
+Catatan:
+
+- `grafana/data/grafana.db` menyimpan dashboard, panel, query, threshold, datasource, user, dan konfigurasi internal Grafana.
+- `grafana/provisioning/` digunakan agar datasource dan dashboard bisa otomatis terbaca saat container Grafana dibuat ulang.
+- `grafana/dashboards/` digunakan untuk menyimpan dashboard JSON agar mudah dipindahkan atau di-restore.
+- Untuk repository publik, folder `grafana/data/` sebaiknya dimasukkan ke `.gitignore` karena berisi database internal Grafana.
+```gitignore
+grafana/data/
 ```
 
 ---
@@ -359,13 +389,26 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=admin12345
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
-      - grafana_data:/var/lib/grafana
+      # Data Grafana dibuat bind mount ke folder project agar dashboard tidak hilang
+      # dan mudah dipindahkan ke device lain.
+      - ./grafana/data:/var/lib/grafana
+
+      # Provisioning agar datasource dan dashboard bisa dibaca otomatis.
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
 
 volumes:
   prometheus_data:
-  grafana_data:
+```
+
+Catatan penting:
+
+- Dengan konfigurasi `./grafana/data:/var/lib/grafana`, data Grafana tidak hanya tersimpan di Docker volume, tetapi masuk ke folder project.
+- File utama yang menandakan backup Grafana berhasil adalah `grafana/data/grafana.db`.
+- `docker compose down` aman.
+- Jangan membiasakan `docker compose down -v` karena dapat menghapus named volume seperti `prometheus_data`.
 ```
 
 Port yang digunakan:
@@ -2329,6 +2372,1168 @@ Tahap berikutnya adalah menyelesaikan:
 - Alertmanager
 - Webhook alerting
 ```
+
+---
+
+# Lampiran Update Final Dashboard Grafana Profesional, Realtime, dan Portable
+
+Bagian ini adalah update terbaru setelah dashboard berhasil dibuat lebih lengkap. Pada tahap ini dashboard tidak lagi hanya menampilkan status dasar, tetapi sudah menjadi dashboard observability MikroTik yang lebih profesional, lebih realtime, dan lebih aman dipindahkan ke device lain.
+
+## Q. Status Final Dashboard Saat Ini
+
+Status terakhir project:
+
+```text
+Dashboard name       : DASHBOARD MIKROTIK
+MikroTik IP          : 192.168.88.1
+RouterOS             : v6.49.9
+Device               : MikroTik RB941-2nD / hAP lite
+Environment          : WSL Ubuntu
+Docker stack          : snmp_exporter + prometheus + grafana
+Datasource           : Prometheus
+Grafana refresh       : 5s
+Prometheus scrape     : 5s untuk job MikroTik utama
+Grafana persistence   : bind mount ke folder ./grafana/data
+Reverse proxy         : Cloudflare Zero Trust / tunnel ubuntu_wsl_rog
+```
+
+Dashboard yang sudah berhasil:
+
+```text
+ROW 1 - MAIN KPI
+[Status Router] [Uptime] [CPU Load] [Memory Usage] [Total Download] [Total Upload]
+
+ROW 2 - PORT HEALTH
+[Port Aktif] [Port Tidak Aktif] [Packet Error] [Packet Drop] [Total Traffic]
+
+ROW 3 - PORT STATUS BESAR
+[Status Port Ethernet]
+
+ROW 4 - TRAFFIC GRAPH
+[Download per Interface]
+
+ROW 5 - TRAFFIC GRAPH
+[Upload per Interface]
+```
+
+Tampilan terakhir sudah menampilkan:
+
+```text
+- Status Router ON/OFF
+- Uptime Router dalam durasi
+- CPU Load dalam persen
+- Memory Usage dalam persen
+- Total Download Traffic
+- Total Upload Traffic
+- Jumlah Port Aktif
+- Jumlah Port Tidak Aktif
+- Packet Error
+- Packet Drop berbentuk Gauge
+- Total Traffic
+- Status Port Ethernet dalam bentuk card/kotak
+- Download per Interface
+- Upload per Interface
+```
+
+---
+
+## R. Konfigurasi Realtime Monitoring
+
+Grafana + Prometheus + SNMP bersifat near real-time, bukan live streaming 0 detik. Agar dashboard terasa lebih realtime, project ini menggunakan kombinasi:
+
+```text
+Prometheus scrape interval : 5s untuk job MikroTik
+Grafana dashboard refresh  : 5s
+Query traffic window       : 30s
+Query packet error/drop    : 1m
+Panel Stat/Gauge           : Instant ON jika hanya butuh nilai terakhir
+```
+
+### R.1 Konfigurasi Prometheus Realtime
+
+Pada `prometheus/prometheus.yml`, job MikroTik utama dibuat lebih cepat:
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets:
+          - "prometheus:9090"
+
+  - job_name: "mikrotik_snmp"
+    scrape_interval: 5s
+    scrape_timeout: 4s
+    metrics_path: /snmp
+    params:
+      module:
+        - if_mib
+      auth:
+        - public_v2
+    static_configs:
+      - targets:
+          - 192.168.88.1
+        labels:
+          router: "mikrotik_hap_lite"
+          location: "lab_wsl"
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+
+      - source_labels: [__param_target]
+        target_label: instance
+
+      - target_label: __address__
+        replacement: snmp_exporter:9116
+```
+
+Catatan:
+
+- `global scrape_interval` boleh tetap `15s`.
+- Job MikroTik yang membutuhkan tampilan realtime bisa diberi `scrape_interval: 5s`.
+- Jangan terlalu agresif ke `1s` pada hAP lite karena bisa membebani router, WSL, dan SNMP exporter.
+- Rekomendasi aman untuk hAP lite: `5s` sampai `10s`.
+
+Setelah mengubah Prometheus:
+
+```bash
+docker exec -it mikrotik_prometheus promtool check config /etc/prometheus/prometheus.yml
+docker compose restart prometheus
+```
+
+Cek target:
+
+```text
+http://localhost:9090/targets
+```
+
+Pastikan target tetap `UP`.
+
+### R.2 Setting Refresh Grafana
+
+Pada dashboard Grafana, bagian kanan atas:
+
+```text
+Refresh → 5s
+```
+
+Gunakan time range yang lebih pendek agar grafik terlihat lebih responsif:
+
+```text
+Last 15 minutes
+```
+
+atau:
+
+```text
+Last 30 minutes
+```
+
+Jika memakai `Last 6 hours`, grafik akan terlihat lebih halus dan kurang terasa realtime karena rentang waktunya terlalu panjang.
+
+---
+
+## S. Custom Module SNMP untuk CPU Load
+
+CPU Load berhasil dibuat menggunakan OID standar HOST-RESOURCES-MIB `hrProcessorLoad`.
+
+### S.1 Test OID CPU dari WSL
+
+```bash
+snmpwalk -v2c -c monitoring123 192.168.88.1 1.3.6.1.2.1.25.3.3.1.2
+```
+
+Contoh output:
+
+```text
+iso.3.6.1.2.1.25.3.3.1.2.1 = INTEGER: 7
+```
+
+Angka tersebut adalah CPU Load dalam persen.
+
+### S.2 Module CPU di `snmp-exporter/snmp.yml`
+
+Tambahkan module:
+
+```yaml
+  mikrotik_cpu:
+    walk:
+    - 1.3.6.1.2.1.25.3.3.1.2
+    metrics:
+    - name: mikrotik_cpu_load_percent
+      oid: 1.3.6.1.2.1.25.3.3.1.2
+      type: gauge
+      help: CPU load percentage from HOST-RESOURCES-MIB hrProcessorLoad.
+      indexes:
+      - labelname: cpu_index
+        type: gauge
+```
+
+Restart SNMP Exporter:
+
+```bash
+docker compose restart snmp_exporter
+```
+
+Test module CPU:
+
+```bash
+curl -s "http://localhost:9116/snmp?target=192.168.88.1&module=mikrotik_cpu&auth=public_v2" | grep -E "mikrotik_cpu_load_percent|snmp_error|error"
+```
+
+Output berhasil:
+
+```text
+# HELP mikrotik_cpu_load_percent CPU load percentage from HOST-RESOURCES-MIB hrProcessorLoad.
+# TYPE mikrotik_cpu_load_percent gauge
+mikrotik_cpu_load_percent{cpu_index="1"} 7
+```
+
+### S.3 Job Prometheus untuk CPU
+
+Tambahkan ke `prometheus/prometheus.yml`:
+
+```yaml
+  - job_name: "mikrotik_cpu"
+    scrape_interval: 5s
+    scrape_timeout: 4s
+    metrics_path: /snmp
+    params:
+      module:
+        - mikrotik_cpu
+      auth:
+        - public_v2
+    static_configs:
+      - targets:
+          - 192.168.88.1
+        labels:
+          router: "mikrotik_hap_lite"
+          location: "lab_wsl"
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+
+      - source_labels: [__param_target]
+        target_label: instance
+
+      - target_label: __address__
+        replacement: snmp_exporter:9116
+```
+
+Validasi:
+
+```bash
+docker exec -it mikrotik_prometheus promtool check config /etc/prometheus/prometheus.yml
+docker compose restart prometheus
+```
+
+Cek di Prometheus:
+
+```promql
+up{job="mikrotik_cpu"}
+```
+
+dan:
+
+```promql
+mikrotik_cpu_load_percent{job="mikrotik_cpu"}
+```
+
+### S.4 Query Grafana CPU Load
+
+Panel:
+
+```text
+Visualization : Stat
+Title         : CPU Load
+Unit          : Percent (0-100)
+Decimals      : 0 atau 1
+Text mode     : Value
+Color mode    : Background
+Graph mode    : None
+Calculation   : Last *
+Instant       : ON
+```
+
+Query:
+
+```promql
+avg(mikrotik_cpu_load_percent{job="mikrotik_cpu"})
+```
+
+Threshold:
+
+```text
+0  = Green
+60 = Yellow
+80 = Red
+```
+
+---
+
+## T. Custom Module SNMP untuk Memory Usage
+
+Memory Usage berhasil dibuat dengan membandingkan nilai used memory dan total memory dari HOST-RESOURCES-MIB.
+
+### T.1 Cek OID Memory dari WSL
+
+Cek daftar storage:
+
+```bash
+snmpwalk -v2c -c monitoring123 192.168.88.1 1.3.6.1.2.1.25.2.3.1.3
+```
+
+Cek total memory unit:
+
+```bash
+snmpwalk -v2c -c monitoring123 192.168.88.1 1.3.6.1.2.1.25.2.3.1.5
+```
+
+Cek used memory unit:
+
+```bash
+snmpwalk -v2c -c monitoring123 192.168.88.1 1.3.6.1.2.1.25.2.3.1.6
+```
+
+### T.2 Module Memory di `snmp-exporter/snmp.yml`
+
+Tambahkan module:
+
+```yaml
+  mikrotik_memory:
+    walk:
+    - 1.3.6.1.2.1.25.2.3.1.5
+    - 1.3.6.1.2.1.25.2.3.1.6
+    metrics:
+    - name: mikrotik_memory_total_units
+      oid: 1.3.6.1.2.1.25.2.3.1.5
+      type: gauge
+      help: Total memory size from HOST-RESOURCES-MIB hrStorageSize.
+      indexes:
+      - labelname: storage_index
+        type: gauge
+    - name: mikrotik_memory_used_units
+      oid: 1.3.6.1.2.1.25.2.3.1.6
+      type: gauge
+      help: Used memory size from HOST-RESOURCES-MIB hrStorageUsed.
+      indexes:
+      - labelname: storage_index
+        type: gauge
+```
+
+Restart SNMP Exporter:
+
+```bash
+docker compose restart snmp_exporter
+```
+
+Test:
+
+```bash
+curl -s "http://localhost:9116/snmp?target=192.168.88.1&module=mikrotik_memory&auth=public_v2" | grep -E "mikrotik_memory|snmp_error|error"
+```
+
+### T.3 Job Prometheus untuk Memory
+
+Tambahkan ke `prometheus/prometheus.yml`:
+
+```yaml
+  - job_name: "mikrotik_memory"
+    scrape_interval: 5s
+    scrape_timeout: 4s
+    metrics_path: /snmp
+    params:
+      module:
+        - mikrotik_memory
+      auth:
+        - public_v2
+    static_configs:
+      - targets:
+          - 192.168.88.1
+        labels:
+          router: "mikrotik_hap_lite"
+          location: "lab_wsl"
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+
+      - source_labels: [__param_target]
+        target_label: instance
+
+      - target_label: __address__
+        replacement: snmp_exporter:9116
+```
+
+Validasi:
+
+```bash
+docker exec -it mikrotik_prometheus promtool check config /etc/prometheus/prometheus.yml
+docker compose restart prometheus
+```
+
+### T.4 Query Grafana Memory Usage
+
+Query umum:
+
+```promql
+avg(
+  (
+    mikrotik_memory_used_units{job="mikrotik_memory"}
+    /
+    mikrotik_memory_total_units{job="mikrotik_memory"}
+  ) * 100
+)
+```
+
+Jika muncul beberapa `storage_index`, gunakan index memory utama:
+
+```promql
+(
+  mikrotik_memory_used_units{job="mikrotik_memory", storage_index="1"}
+  /
+  mikrotik_memory_total_units{job="mikrotik_memory", storage_index="1"}
+) * 100
+```
+
+Panel:
+
+```text
+Visualization : Stat
+Title         : Memory Usage
+Unit          : Percent (0-100)
+Decimals      : 1
+Text mode     : Value
+Color mode    : Background
+Graph mode    : None
+Calculation   : Last *
+Instant       : ON
+```
+
+Threshold:
+
+```text
+0  = Green
+70 = Yellow
+85 = Red
+```
+
+Catatan:
+
+- Field `No value` di Grafana bukan tempat menulis threshold.
+- `No value` cukup diisi `No data` atau `-`.
+- Threshold diatur pada bagian `Thresholds`.
+
+---
+
+## U. Query Final Panel Dashboard
+
+### U.1 Status Router
+
+```promql
+up{job="mikrotik_snmp"}
+```
+
+Setting:
+
+```text
+Visualization : Stat
+Value mapping : 1 = 🟢 ON, 0 = 🔴 OFF
+Color mode    : Background
+Graph mode    : None
+Instant       : ON
+```
+
+### U.2 Uptime Router
+
+```promql
+mikrotik_sys_uptime_seconds{job="mikrotik_uptime"}
+```
+
+Setting:
+
+```text
+Visualization : Stat
+Unit          : Duration / seconds
+Color mode    : Background
+Graph mode    : None
+Instant       : ON
+```
+
+### U.3 CPU Load
+
+```promql
+avg(mikrotik_cpu_load_percent{job="mikrotik_cpu"})
+```
+
+### U.4 Memory Usage
+
+```promql
+avg(
+  (
+    mikrotik_memory_used_units{job="mikrotik_memory"}
+    /
+    mikrotik_memory_total_units{job="mikrotik_memory"}
+  ) * 100
+)
+```
+
+### U.5 Total Download Traffic Realtime
+
+```promql
+sum(rate(ifHCInOctets{job="mikrotik_snmp"}[30s]) * 8)
+```
+
+### U.6 Total Upload Traffic Realtime
+
+```promql
+sum(rate(ifHCOutOctets{job="mikrotik_snmp"}[30s]) * 8)
+```
+
+### U.7 Port Aktif
+
+Jika hanya menghitung port ethernet:
+
+```promql
+sum(ifOperStatus{job="mikrotik_snmp", ifName=~"ether.*"} == bool 1)
+```
+
+Setting:
+
+```text
+Visualization : Stat
+Title         : Port Aktif
+Decimals      : 0
+Instant       : ON
+```
+
+### U.8 Port Tidak Aktif
+
+Jika hanya menghitung port ethernet:
+
+```promql
+sum(ifOperStatus{job="mikrotik_snmp", ifName=~"ether.*"} == bool 2)
+```
+
+Setting:
+
+```text
+Visualization : Stat
+Title         : Port Tidak Aktif
+Decimals      : 0
+Instant       : ON
+```
+
+Catatan:
+
+- Port tidak aktif belum tentu rusak.
+- Bisa saja port tidak digunakan, kabel tidak terpasang, atau perangkat di ujung kabel sedang mati.
+
+### U.9 Packet Error
+
+```promql
+sum(
+  increase(ifInErrors{job="mikrotik_snmp"}[1m])
+  +
+  increase(ifOutErrors{job="mikrotik_snmp"}[1m])
+)
+```
+
+Setting:
+
+```text
+Visualization : Stat
+Title         : Packet Error
+Decimals      : 0
+Color mode    : Background
+Instant       : ON
+```
+
+Threshold:
+
+```text
+0  = Green
+1  = Yellow
+10 = Red
+```
+
+### U.10 Packet Drop / Discard
+
+```promql
+sum(
+  increase(ifInDiscards{job="mikrotik_snmp"}[1m])
+  +
+  increase(ifOutDiscards{job="mikrotik_snmp"}[1m])
+)
+```
+
+Setting:
+
+```text
+Visualization : Gauge
+Title         : Packet Drop
+Min           : 0
+Max           : 10
+Decimals      : 0
+Instant       : ON
+```
+
+Threshold:
+
+```text
+0  = Green
+1  = Yellow
+10 = Red
+```
+
+### U.11 Total Traffic
+
+```promql
+sum(
+  (
+    rate(ifHCInOctets{job="mikrotik_snmp"}[30s])
+    +
+    rate(ifHCOutOctets{job="mikrotik_snmp"}[30s])
+  ) * 8
+)
+```
+
+Setting:
+
+```text
+Visualization : Stat
+Title         : Total Traffic
+Unit          : bits/sec
+Graph mode    : Area
+```
+
+### U.12 Status Port Ethernet Besar
+
+```promql
+ifOperStatus{job="mikrotik_snmp", ifName!=""}
+```
+
+atau khusus ethernet:
+
+```promql
+ifOperStatus{job="mikrotik_snmp", ifName=~"ether.*"}
+```
+
+Setting:
+
+```text
+Visualization : Stat
+Show          : All values
+Instant       : ON
+Legend        : {{ifName}}
+Text mode     : Name and value
+Color mode    : Background
+Graph mode    : None
+Orientation   : Horizontal
+```
+
+Value mapping:
+
+```text
+1 = ✅ TERPAKAI / LINK UP
+2 = ❌ TIDAK TERPAKAI / LINK DOWN
+```
+
+### U.13 Download per Interface Realtime
+
+```promql
+rate(ifHCInOctets{job="mikrotik_snmp"}[30s]) * 8
+```
+
+Setting:
+
+```text
+Visualization : Time series
+Unit          : bits/sec
+Legend        : {{ifName}}
+```
+
+### U.14 Upload per Interface Realtime
+
+```promql
+rate(ifHCOutOctets{job="mikrotik_snmp"}[30s]) * 8
+```
+
+Setting:
+
+```text
+Visualization : Time series
+Unit          : bits/sec
+Legend        : {{ifName}}
+```
+
+---
+
+## V. Penyimpanan Konfigurasi Grafana ke Folder Project
+
+Pada tahap awal, Grafana menyimpan dashboard dan konfigurasi ke Docker named volume:
+
+```yaml
+- grafana_data:/var/lib/grafana
+```
+
+Konfigurasi tersebut aman saat `docker compose down`, tetapi tidak terlihat langsung di folder project. Agar mudah dipindah ke device lain, project ini diubah menjadi bind mount ke folder lokal:
+
+```yaml
+- ./grafana/data:/var/lib/grafana
+```
+
+Dengan perubahan ini, data Grafana tersimpan di:
+
+```text
+grafana/data/
+```
+
+File penting yang muncul:
+
+```text
+grafana/data/grafana.db
+```
+
+File `grafana.db` menyimpan:
+
+```text
+- Dashboard
+- Panel
+- Query PromQL
+- Threshold
+- Datasource
+- User/login Grafana
+- Setting dashboard
+- Layout visualisasi
+```
+
+### V.1 Struktur Folder Grafana Setelah Backup Lokal
+
+```text
+grafana/
+├── data/
+│   ├── grafana.db
+│   ├── csv/
+│   ├── dashboards/
+│   ├── pdf/
+│   ├── plugins/
+│   └── png/
+├── dashboards/
+│   └── dashboard-mikrotik.json
+└── provisioning/
+    ├── dashboards/
+    │   └── mikrotik-dashboard.yml
+    └── datasources/
+        └── prometheus.yml
+```
+
+### V.2 Cara Migrasi dari Docker Volume ke Folder Lokal
+
+Stop Grafana:
+
+```bash
+docker compose stop grafana
+```
+
+Buat folder:
+
+```bash
+mkdir -p grafana/data
+mkdir -p grafana/provisioning/datasources
+mkdir -p grafana/provisioning/dashboards
+mkdir -p grafana/dashboards
+```
+
+Cek nama volume Grafana lama:
+
+```bash
+docker volume ls | grep grafana
+```
+
+Copy isi volume ke folder lokal:
+
+```bash
+GRAFANA_VOL=$(docker volume ls --format '{{.Name}}' | grep 'grafana_data$' | head -n 1)
+
+docker run --rm \
+  -v "$GRAFANA_VOL:/from:ro" \
+  -v "$PWD/grafana/data:/to" \
+  alpine sh -c 'cd /from && cp -a . /to/'
+```
+
+Set permission:
+
+```bash
+sudo chown -R 472:472 grafana/data
+```
+
+Ubah `docker-compose.yml` bagian Grafana:
+
+```yaml
+  grafana:
+    image: grafana/grafana:latest
+    container_name: mikrotik_grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin12345
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+```
+
+Jalankan kembali:
+
+```bash
+docker compose up -d grafana
+```
+
+Cek log:
+
+```bash
+docker logs mikrotik_grafana --tail=80
+```
+
+Buka Grafana:
+
+```text
+http://localhost:3000
+```
+
+Jika dashboard masih tampil, berarti migrasi ke folder lokal berhasil.
+
+### V.3 Perbedaan Docker Volume dan Folder Lokal
+
+| Metode | Lokasi Data | Kelebihan | Kekurangan |
+|---|---|---|---|
+| Docker named volume | Internal Docker | Aman untuk pemakaian normal | Tidak terlihat langsung di folder project |
+| Bind mount folder lokal | `./grafana/data` | Mudah dibackup dan dipindahkan | Perlu menjaga permission folder |
+
+### V.4 Perintah Aman
+
+Aman:
+
+```bash
+docker compose down
+docker compose up -d
+```
+
+Hati-hati:
+
+```bash
+docker compose down -v
+docker volume prune
+docker volume rm nama_volume
+```
+
+Jika sudah memakai bind mount `./grafana/data:/var/lib/grafana`, folder `grafana/data` tetap ada. Namun perintah `down -v` tetap tidak disarankan karena bisa menghapus volume lain seperti `prometheus_data`.
+
+---
+
+## W. Provisioning Grafana agar Dashboard dan Datasource Otomatis
+
+Selain menyimpan runtime Grafana ke `grafana/data`, project ini juga menyiapkan provisioning agar datasource dan dashboard bisa dibaca otomatis.
+
+### W.1 Datasource Provisioning
+
+File:
+
+```text
+grafana/provisioning/datasources/prometheus.yml
+```
+
+Isi:
+
+```yaml
+apiVersion: 1
+
+datasources:
+  - name: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+```
+
+Jika Grafana tidak bisa resolve `prometheus`, gunakan nama container:
+
+```yaml
+url: http://mikrotik_prometheus:9090
+```
+
+### W.2 Dashboard Provider
+
+File:
+
+```text
+grafana/provisioning/dashboards/mikrotik-dashboard.yml
+```
+
+Isi:
+
+```yaml
+apiVersion: 1
+
+providers:
+  - name: mikrotik-dashboard-provider
+    orgId: 1
+    folder: MikroTik Monitoring
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards
+```
+
+### W.3 Dashboard JSON
+
+Dashboard bisa diexport dari Grafana:
+
+```text
+Dashboard → Share → Export → Save to file
+```
+
+Simpan ke:
+
+```text
+grafana/dashboards/dashboard-mikrotik.json
+```
+
+Atau export menggunakan API:
+
+```bash
+curl -s -u admin:admin12345 \
+  http://localhost:3000/api/dashboards/uid/atdvn2k \
+  -o /tmp/dashboard-response.json
+```
+
+Ambil bagian dashboard saja:
+
+```bash
+python3 - <<'PY'
+import json
+
+src = "/tmp/dashboard-response.json"
+dst = "grafana/dashboards/dashboard-mikrotik.json"
+
+with open(src, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+dashboard = data["dashboard"]
+dashboard["id"] = None
+
+with open(dst, "w", encoding="utf-8") as f:
+    json.dump(dashboard, f, indent=2, ensure_ascii=False)
+
+print(f"Dashboard exported to {dst}")
+PY
+```
+
+Catatan:
+
+- Jika password admin sudah diganti, sesuaikan `-u admin:admin12345`.
+- UID dashboard dari URL project terlihat seperti `atdvn2k`.
+
+---
+
+## X. Sharing Dashboard Grafana
+
+Grafana menyediakan beberapa pilihan share:
+
+```text
+Share internally
+Share externally
+Share snapshot
+```
+
+### X.1 Share Internally
+
+Digunakan jika orang yang menerima link punya akses login ke Grafana.
+
+```text
+Share → Share internally → Copy link
+```
+
+Jika link masih memakai:
+
+```text
+http://localhost:3000/...
+```
+
+maka link hanya bisa dibuka dari laptop/WSL sendiri.
+
+Agar bisa dibuka dari luar, gunakan domain Cloudflare Zero Trust yang mengarah ke Grafana.
+
+### X.2 Share Externally
+
+Digunakan untuk membuat public dashboard link jika fitur public dashboard aktif di Grafana.
+
+Catatan:
+
+- Tetap membutuhkan Grafana bisa diakses dari luar.
+- Untuk monitoring jaringan, jangan sembarangan membuka dashboard ke publik.
+- Lebih aman pakai Cloudflare Access.
+
+### X.3 Share Snapshot
+
+Digunakan untuk membagikan tampilan dashboard statis pada saat itu saja.
+
+Catatan:
+
+- Snapshot bukan realtime.
+- Cocok untuk bukti laporan atau dokumentasi.
+- Tidak cocok untuk monitoring live.
+
+Rekomendasi project:
+
+```text
+Cloudflare Zero Trust / Access
+        ↓
+Grafana login
+        ↓
+Dashboard realtime
+```
+
+Jangan expose:
+
+```text
+Prometheus    : 9090
+SNMP Exporter : 9116
+```
+
+---
+
+## Y. Backup Project
+
+Karena dashboard sudah cukup lengkap, backup yang disarankan ada dua jenis.
+
+### Y.1 Backup Runtime Grafana
+
+Backup folder `grafana/data`:
+
+```bash
+mkdir -p backups
+tar czf backups/grafana_data_backup_$(date +%Y%m%d_%H%M%S).tar.gz grafana/data
+```
+
+Restore:
+
+```bash
+tar xzf backups/grafana_data_backup_YYYYMMDD_HHMMSS.tar.gz
+sudo chown -R 472:472 grafana/data
+docker compose up -d grafana
+```
+
+### Y.2 Backup Dashboard JSON
+
+Simpan file dashboard JSON ke:
+
+```text
+grafana/dashboards/dashboard-mikrotik.json
+```
+
+File ini berguna jika ingin restore dashboard tanpa membawa semua database Grafana.
+
+### Y.3 File yang Sebaiknya Dicadangkan
+
+```text
+docker-compose.yml
+prometheus/prometheus.yml
+snmp-exporter/snmp.yml
+grafana/provisioning/
+grafana/dashboards/
+grafana/data/
+penjelasan_dari_awal.md
+README.md
+```
+
+### Y.4 File yang Aman Di-commit ke Git
+
+```text
+docker-compose.yml
+prometheus/prometheus.yml
+snmp-exporter/snmp.yml
+grafana/provisioning/
+grafana/dashboards/
+README.md
+penjelasan_dari_awal.md
+```
+
+### Y.5 File yang Sebaiknya Tidak Di-commit ke Git Public
+
+```text
+grafana/data/
+backups/
+```
+
+Tambahkan ke `.gitignore`:
+
+```gitignore
+grafana/data/
+backups/
+```
+
+---
+
+## Z. Status Akhir Setelah Update Ini
+
+Status project setelah update terbaru:
+
+```text
+Ping WSL ke MikroTik                : BERHASIL
+SNMP MikroTik                       : BERHASIL
+SNMPWalk dari WSL                   : BERHASIL
+SNMP Exporter if_mib                : BERHASIL
+Custom module uptime                : BERHASIL
+Custom module CPU Load              : BERHASIL
+Custom module Memory Usage          : BERHASIL
+Prometheus target mikrotik_snmp     : UP
+Prometheus target mikrotik_uptime   : UP
+Prometheus target mikrotik_cpu      : UP
+Prometheus target mikrotik_memory   : UP
+Grafana datasource Prometheus       : BERHASIL
+Dashboard row 1 MAIN KPI            : BERHASIL
+Dashboard row 2 PORT HEALTH         : BERHASIL
+Status port ethernet card           : BERHASIL
+Traffic graph per interface         : BERHASIL
+Grafana refresh 5s                  : BERHASIL
+Grafana data bind mount ke folder   : BERHASIL
+```
+
+Dashboard saat ini sudah layak disebut sebagai dashboard observability karena menampilkan:
+
+```text
+Availability  : Status Router ON/OFF
+Performance   : CPU Load, Memory Usage, Traffic
+Interface     : Status port, port aktif, port tidak aktif
+Reliability   : Packet Error, Packet Drop
+Realtime-ish  : Refresh 5s dan scrape 5s
+Portability   : Grafana data tersimpan di folder project
+```
+
+Tahap berikutnya yang bisa dikembangkan:
+
+```text
+1. Packet Error per Interface
+2. Packet Drop per Interface
+3. Alertmanager
+4. Alert rules untuk RouterDown, InterfaceDown, HighTraffic, dan PacketDrop
+5. Webhook alert ke Telegram/WhatsApp/email
+6. Export dashboard JSON final untuk repository
+7. Dokumentasi deployment via Cloudflare Zero Trust
+```
+
 
 ## 24. Catatan Keamanan
 
