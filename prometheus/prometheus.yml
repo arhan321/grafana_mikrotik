@@ -9,6 +9,8 @@ scrape_configs:
           - "prometheus:9090"
 
   - job_name: "mikrotik_snmp"
+    scrape_interval: 5s
+    scrape_timeout: 4s
     metrics_path: /snmp
     params:
       module:
