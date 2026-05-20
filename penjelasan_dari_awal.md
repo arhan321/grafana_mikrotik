@@ -1405,6 +1405,931 @@ Tahap berikutnya:
 
 ---
 
+
+---
+
+# Lampiran Update Terbaru Project Grafana
+
+Bagian ini adalah update terakhir dari project dashboard Grafana yang sedang dikerjakan. Tutorial utama di atas tetap dipertahankan, sedangkan bagian ini menjelaskan kondisi terbaru dashboard, konfigurasi terbaru, panel yang sudah berhasil, dan catatan teknis terbaru.
+
+## A. Status Project Grafana Terakhir
+
+```text
+Dashboard name : DASHBOARD MIKROTIK
+MikroTik IP    : 192.168.88.1
+RouterOS       : v6.49.9
+Device         : MikroTik RB941-2nD / hAP lite
+Environment    : WSL Ubuntu
+Docker stack   : snmp_exporter + prometheus + grafana
+Datasource     : Prometheus
+Reverse proxy  : Cloudflare Zero Trust / tunnel ubuntu_wsl_rog
+```
+
+Status terakhir:
+
+```text
+Ping WSL ke MikroTik              : BERHASIL
+SNMP MikroTik                     : BERHASIL
+SNMPWalk dari WSL                 : BERHASIL
+SNMP Exporter                     : BERHASIL
+Prometheus target mikrotik_snmp   : UP
+Prometheus target mikrotik_uptime : UP
+Grafana datasource Prometheus     : BERHASIL
+Dashboard Grafana                 : BERHASIL
+```
+
+Dashboard saat ini sudah menampilkan:
+
+```text
+- Status Router MikroTik dalam bentuk ON/OFF
+- Total Download Traffic
+- Total Upload Traffic
+- Uptime Router MikroTik dalam bentuk durasi
+- Status Port Ethernet dalam bentuk kotak/card
+- Download per Interface
+- Upload per Interface
+```
+
+Top row yang sedang ditargetkan:
+
+```text
+[Status Router] [Uptime] [CPU Load] [Memory Usage] [Total Download] [Total Upload]
+```
+
+Yang sudah berhasil:
+
+```text
+[Status Router] [Uptime] [Total Download] [Total Upload]
+```
+
+Yang sedang dilanjutkan:
+
+```text
+[CPU Load] [Memory Usage]
+```
+
+---
+
+## B. Konfigurasi Prometheus Terbaru
+
+Pada versi project terakhir, Prometheus menggunakan beberapa scrape job:
+
+| Job | Fungsi |
+|---|---|
+| `prometheus` | Monitoring Prometheus sendiri |
+| `mikrotik_snmp` | Mengambil data interface, traffic, dan status port dari MikroTik |
+| `mikrotik_uptime` | Mengambil uptime MikroTik menggunakan module custom |
+| `mikrotik_health` | Persiapan mengambil health metric MikroTik seperti CPU dan memory |
+
+Isi `prometheus/prometheus.yml` terbaru yang rapi:
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets:
+          - "prometheus:9090"
+
+  - job_name: "mikrotik_snmp"
+    metrics_path: /snmp
+    params:
+      module:
+        - if_mib
+      auth:
+        - public_v2
+    static_configs:
+      - targets:
+          - 192.168.88.1
+        labels:
+          router: "mikrotik_hap_lite"
+          location: "lab_wsl"
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+
+      - source_labels: [__param_target]
+        target_label: instance
+
+      - target_label: __address__
+        replacement: snmp_exporter:9116
+
+  - job_name: "mikrotik_uptime"
+    metrics_path: /snmp
+    params:
+      module:
+        - mikrotik_uptime
+      auth:
+        - public_v2
+    static_configs:
+      - targets:
+          - 192.168.88.1
+        labels:
+          router: "mikrotik_hap_lite"
+          location: "lab_wsl"
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+
+      - source_labels: [__param_target]
+        target_label: instance
+
+      - target_label: __address__
+        replacement: snmp_exporter:9116
+
+  - job_name: "mikrotik_health"
+    metrics_path: /snmp
+    params:
+      module:
+        - mikrotik
+      auth:
+        - public_v2
+    static_configs:
+      - targets:
+          - 192.168.88.1
+        labels:
+          router: "mikrotik_hap_lite"
+          location: "lab_wsl"
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+
+      - source_labels: [__param_target]
+        target_label: instance
+
+      - target_label: __address__
+        replacement: snmp_exporter:9116
+```
+
+Catatan penting:
+
+```text
+Jangan membuat job_name yang sama lebih dari satu kali.
+```
+
+Project sempat mengalami Prometheus restart terus karena `mikrotik_health` tertulis dua kali. Solusinya adalah menghapus salah satu job yang duplikat.
+
+Validasi config Prometheus:
+
+```bash
+docker exec -it mikrotik_prometheus promtool check config /etc/prometheus/prometheus.yml
+```
+
+Restart Prometheus:
+
+```bash
+docker compose restart prometheus
+```
+
+Cek target:
+
+```text
+http://localhost:9090/targets
+```
+
+Target yang diharapkan:
+
+```text
+prometheus        UP
+mikrotik_snmp     UP
+mikrotik_uptime   UP
+mikrotik_health   UP
+```
+
+---
+
+## C. Module Custom Uptime MikroTik
+
+Panel uptime awalnya menampilkan:
+
+```text
+No data
+```
+
+Penyebabnya karena module `if_mib` fokus pada interface/port dan belum membawa data uptime router.
+
+Solusi yang digunakan adalah menambahkan module custom `mikrotik_uptime` ke file:
+
+```text
+snmp-exporter/snmp.yml
+```
+
+Backup file terlebih dahulu:
+
+```bash
+cp snmp-exporter/snmp.yml snmp-exporter/snmp.yml.backup
+```
+
+Tambahkan module custom:
+
+```bash
+cat >> snmp-exporter/snmp.yml <<'EOF'
+
+  mikrotik_uptime:
+    walk:
+    - 1.3.6.1.2.1.1.3
+    metrics:
+    - name: mikrotik_sys_uptime_seconds
+      oid: 1.3.6.1.2.1.1.3
+      type: gauge
+      scale: 0.01
+      help: Router uptime in seconds from SNMP sysUpTime.
+EOF
+```
+
+Restart SNMP Exporter:
+
+```bash
+docker compose restart snmp_exporter
+```
+
+Test module uptime:
+
+```bash
+curl "http://localhost:9116/snmp?target=192.168.88.1&module=mikrotik_uptime&auth=public_v2" | grep -i uptime
+```
+
+Output yang diharapkan:
+
+```text
+# HELP mikrotik_sys_uptime_seconds Router uptime in seconds from SNMP sysUpTime.
+# TYPE mikrotik_sys_uptime_seconds gauge
+mikrotik_sys_uptime_seconds 12345
+```
+
+Query Grafana untuk uptime:
+
+```promql
+mikrotik_sys_uptime_seconds{job="mikrotik_uptime"}
+```
+
+Unit di Grafana:
+
+```text
+Duration / seconds
+```
+
+---
+
+## D. Panel Status Router ON/OFF
+
+Panel status router awalnya menampilkan angka `1`. Agar lebih mudah dipahami orang awam, angka tersebut diubah menjadi `ON`.
+
+Query:
+
+```promql
+up{job="mikrotik_snmp"}
+```
+
+Visualization:
+
+```text
+Stat
+```
+
+Setting panel:
+
+```text
+Title       : Status Router MikroTik
+Text mode   : Value
+Color mode  : Background
+Graph mode  : None
+Calculation : Last *
+```
+
+Value mapping:
+
+```text
+Value        : 1
+Display text : 🟢 ON
+Color        : Green
+```
+
+```text
+Value        : 0
+Display text : 🔴 OFF
+Color        : Red
+```
+
+Hasil akhir:
+
+```text
+🟢 ON
+```
+
+atau jika router down:
+
+```text
+🔴 OFF
+```
+
+---
+
+## E. Panel Uptime Router MikroTik
+
+Query:
+
+```promql
+mikrotik_sys_uptime_seconds{job="mikrotik_uptime"}
+```
+
+Visualization:
+
+```text
+Stat
+```
+
+Setting panel:
+
+```text
+Title       : Uptime Router MikroTik
+Text mode   : Value
+Color mode  : Background
+Graph mode  : None
+Calculation : Last *
+Unit        : Duration / seconds
+```
+
+Threshold yang disarankan:
+
+```text
+0      = Red
+300    = Yellow
+3600   = Green
+```
+
+Artinya:
+
+```text
+< 5 menit   = merah, kemungkinan router baru reboot
+> 5 menit   = kuning
+> 1 jam     = hijau, normal
+```
+
+Contoh tampilan yang sudah berhasil:
+
+```text
+3 hours
+```
+
+---
+
+## F. Panel Total Download Traffic
+
+Query:
+
+```promql
+sum(rate(ifHCInOctets{job="mikrotik_snmp"}[5m]) * 8)
+```
+
+Visualization:
+
+```text
+Stat
+```
+
+Unit:
+
+```text
+bits/sec
+```
+
+Judul:
+
+```text
+Total Download Traffic
+```
+
+Setting yang disarankan:
+
+```text
+Text mode   : Value
+Color mode  : Background
+Graph mode  : Area
+Calculation : Last *
+```
+
+---
+
+## G. Panel Total Upload Traffic
+
+Query:
+
+```promql
+sum(rate(ifHCOutOctets{job="mikrotik_snmp"}[5m]) * 8)
+```
+
+Visualization:
+
+```text
+Stat
+```
+
+Unit:
+
+```text
+bits/sec
+```
+
+Judul:
+
+```text
+Total Upload Traffic
+```
+
+Setting yang disarankan:
+
+```text
+Text mode   : Value
+Color mode  : Background
+Graph mode  : Area
+Calculation : Last *
+```
+
+---
+
+## H. Panel Status Port Ethernet dalam Bentuk Kotak/Card
+
+Panel status interface awalnya masih tampil seperti table mentah dengan banyak timestamp. Supaya lebih jelas untuk orang awam, panel diubah menjadi `Stat` dengan tampilan card/kotak.
+
+Query untuk semua interface:
+
+```promql
+ifOperStatus{job="mikrotik_snmp", ifName!=""}
+```
+
+Query untuk interface ethernet saja:
+
+```promql
+ifOperStatus{job="mikrotik_snmp", ifName=~"ether.*"}
+```
+
+Visualization:
+
+```text
+Stat
+```
+
+Setting penting:
+
+```text
+Instant      : ON
+Show         : All values
+Calculation  : Last *
+Legend       : {{ifName}}
+Text mode    : Name and value
+Color mode   : Background
+Graph mode   : None
+Orientation  : Horizontal
+```
+
+Value mapping:
+
+```text
+Value        : 1
+Display text : ✅ TERPAKAI / LINK UP
+Color        : Green
+```
+
+```text
+Value        : 2
+Display text : ❌ TIDAK TERPAKAI / LINK DOWN
+Color        : Red
+```
+
+Contoh hasil:
+
+```text
+ether1    ✅ TERPAKAI / LINK UP
+ether2    ❌ TIDAK TERPAKAI / LINK DOWN
+ether3    ❌ TIDAK TERPAKAI / LINK DOWN
+ether4    ❌ TIDAK TERPAKAI / LINK DOWN
+wlan1     ❌ TIDAK TERPAKAI / LINK DOWN
+```
+
+Catatan:
+
+- Nilai `1` berarti link aktif/up.
+- Nilai `2` berarti link down/tidak ada link.
+- Port dengan nilai `2` belum tentu rusak. Biasanya hanya tidak dipakai, kabel tidak terpasang, atau perangkat di ujung kabel mati.
+
+---
+
+## I. Panel Download per Interface
+
+Query:
+
+```promql
+rate(ifHCInOctets{job="mikrotik_snmp"}[5m]) * 8
+```
+
+Visualization:
+
+```text
+Time series
+```
+
+Unit:
+
+```text
+bits/sec
+```
+
+Legend:
+
+```text
+{{ifName}}
+```
+
+Judul:
+
+```text
+Download per Interface
+```
+
+---
+
+## J. Panel Upload per Interface
+
+Query:
+
+```promql
+rate(ifHCOutOctets{job="mikrotik_snmp"}[5m]) * 8
+```
+
+Visualization:
+
+```text
+Time series
+```
+
+Unit:
+
+```text
+bits/sec
+```
+
+Legend:
+
+```text
+{{ifName}}
+```
+
+Judul:
+
+```text
+Upload per Interface
+```
+
+---
+
+## K. Panel CPU Load MikroTik
+
+Panel CPU Load sedang disiapkan melalui job:
+
+```text
+mikrotik_health
+```
+
+Query yang dicoba:
+
+```promql
+avg(mtxrHlProcessorLoad{job="mikrotik_health"})
+```
+
+Visualization:
+
+```text
+Stat
+```
+
+Setting yang disarankan:
+
+```text
+Title       : CPU Load
+Unit        : Percent (0-100)
+Text mode   : Value
+Color mode  : Background
+Graph mode  : None
+Calculation : Last *
+```
+
+Threshold:
+
+```text
+0  = Green
+60 = Yellow
+80 = Red
+```
+
+Jika query `No data`, cek metric yang tersedia dari module `mikrotik`:
+
+```bash
+curl -s "http://localhost:9116/snmp?target=192.168.88.1&module=mikrotik&auth=public_v2" > /tmp/mikrotik_metrics.txt
+grep -Ei "mtxr|processor|cpu|load|memory|free|used|ram" /tmp/mikrotik_metrics.txt
+```
+
+Pada pengecekan terakhir, metric yang sudah terlihat adalah:
+
+```text
+mtxrHlProcessorFrequency 650
+```
+
+Jika CPU load belum muncul, maka perlu dibuat module custom tambahan berdasarkan OID CPU yang didukung MikroTik hAP lite / RouterOS v6.49.9.
+
+---
+
+## L. Panel Memory Usage MikroTik
+
+Panel Memory Usage sedang disiapkan melalui job:
+
+```text
+mikrotik_health
+```
+
+Query yang dicoba:
+
+```promql
+(
+  mtxrHlMemoryUsed{job="mikrotik_health"}
+  /
+  (mtxrHlMemoryUsed{job="mikrotik_health"} + mtxrHlMemoryFree{job="mikrotik_health"})
+) * 100
+```
+
+Visualization:
+
+```text
+Stat
+```
+
+Setting yang disarankan:
+
+```text
+Title       : Memory Usage
+Unit        : Percent (0-100)
+Text mode   : Value
+Color mode  : Background
+Graph mode  : None
+Calculation : Last *
+Decimals    : 1
+```
+
+Threshold:
+
+```text
+0  = Green
+70 = Yellow
+85 = Red
+```
+
+Jika query `No data`, cek metric memory:
+
+```bash
+curl "http://localhost:9116/snmp?target=192.168.88.1&module=mikrotik&auth=public_v2" | grep -Ei "memory|ram|free|used"
+```
+
+Jika tidak ada output, maka perlu cek OID memory yang tersedia di perangkat dan membuat module custom.
+
+---
+
+## M. Layout Dashboard Profesional yang Ditargetkan
+
+Layout awal yang sudah berhasil:
+
+```text
+Baris 1:
+[Status Router MikroTik] [Total Download Traffic] [Total Upload Traffic] [Uptime Router MikroTik]
+
+Baris 2:
+[Status Port Ethernet]
+
+Baris 3:
+[Download per Interface]
+
+Baris 4:
+[Upload per Interface]
+```
+
+Layout final yang ditargetkan:
+
+```text
+ROW 1 - MAIN KPI
+[Status Router] [Uptime] [CPU Load] [Memory Usage] [Total Download] [Total Upload]
+
+ROW 2 - PORT HEALTH
+[Port Aktif] [Port Tidak Aktif] [Total Traffic] [Packet Error] [Packet Drop]
+
+ROW 3 - PORT STATUS BESAR
+[Status Port Ethernet]
+
+ROW 4 - TRAFFIC GRAPH
+[Download per Interface]
+
+ROW 5 - TRAFFIC GRAPH
+[Upload per Interface]
+
+ROW 6 - TROUBLESHOOTING
+[Packet Error per Interface] [Packet Drop per Interface]
+```
+
+---
+
+## N. Query PromQL Tambahan
+
+### Status router
+
+```promql
+up{job="mikrotik_snmp"}
+```
+
+### Uptime router
+
+```promql
+mikrotik_sys_uptime_seconds{job="mikrotik_uptime"}
+```
+
+### Total traffic upload + download
+
+```promql
+sum((rate(ifHCInOctets{job="mikrotik_snmp"}[5m]) + rate(ifHCOutOctets{job="mikrotik_snmp"}[5m])) * 8)
+```
+
+### Status semua interface
+
+```promql
+ifOperStatus{job="mikrotik_snmp", ifName!=""}
+```
+
+### Status ethernet saja
+
+```promql
+ifOperStatus{job="mikrotik_snmp", ifName=~"ether.*"}
+```
+
+### Jumlah port aktif
+
+```promql
+sum(ifOperStatus{job="mikrotik_snmp", ifName!=""} == bool 1)
+```
+
+### Jumlah port tidak aktif
+
+```promql
+sum(ifOperStatus{job="mikrotik_snmp", ifName!=""} == bool 2)
+```
+
+### Packet error
+
+```promql
+sum(rate(ifInErrors{job="mikrotik_snmp"}[5m]) + rate(ifOutErrors{job="mikrotik_snmp"}[5m]))
+```
+
+### Packet drop/discard
+
+```promql
+sum(rate(ifInDiscards{job="mikrotik_snmp"}[5m]) + rate(ifOutDiscards{job="mikrotik_snmp"}[5m]))
+```
+
+---
+
+## O. Troubleshooting Tambahan dari Project Terakhir
+
+### O.1 Prometheus restart terus
+
+Cek log:
+
+```bash
+docker logs mikrotik_prometheus --tail=80
+```
+
+Penyebab yang pernah terjadi:
+
+```text
+job_name: "mikrotik_health"
+```
+
+tertulis dua kali di `prometheus/prometheus.yml`.
+
+Solusi:
+
+- Hapus salah satu job yang dobel.
+- Pastikan semua `job_name` unik.
+- Validasi config dengan `promtool`.
+
+```bash
+docker exec -it mikrotik_prometheus promtool check config /etc/prometheus/prometheus.yml
+```
+
+---
+
+### O.2 Grafana gagal query Prometheus
+
+Jika muncul error seperti:
+
+```text
+lookup prometheus: i/o timeout
+```
+
+Test dari dalam container Grafana:
+
+```bash
+docker exec -it mikrotik_grafana sh -lc 'wget -qO- http://prometheus:9090/-/ready'
+```
+
+Jika gagal, test memakai nama container:
+
+```bash
+docker exec -it mikrotik_grafana sh -lc 'wget -qO- http://mikrotik_prometheus:9090/-/ready'
+```
+
+Jika yang kedua berhasil, ubah datasource Grafana menjadi:
+
+```text
+http://mikrotik_prometheus:9090
+```
+
+Jika normal, datasource tetap bisa menggunakan:
+
+```text
+http://prometheus:9090
+```
+
+---
+
+### O.3 Panel uptime No data
+
+Gunakan query ini:
+
+```promql
+mikrotik_sys_uptime_seconds{job="mikrotik_uptime"}
+```
+
+Pastikan:
+
+```text
+mikrotik_uptime    UP
+```
+
+di halaman:
+
+```text
+http://localhost:9090/targets
+```
+
+---
+
+### O.4 CPU Load / Memory Usage No data
+
+Cek metric yang tersedia:
+
+```bash
+curl -s "http://localhost:9116/snmp?target=192.168.88.1&module=mikrotik&auth=public_v2" > /tmp/mikrotik_metrics.txt
+grep -Ei "mtxr|processor|cpu|load|memory|free|used|ram" /tmp/mikrotik_metrics.txt
+```
+
+Jika hanya muncul:
+
+```text
+mtxrHlProcessorFrequency 650
+```
+
+Berarti module bawaan belum cukup untuk CPU load/memory usage. Perlu dibuat module custom tambahan berdasarkan OID yang didukung perangkat.
+
+---
+
+## P. Kesimpulan Update Terakhir
+
+Project sudah berhasil membangun dashboard observability MikroTik berbasis Docker dengan alur:
+
+```text
+MikroTik → SNMP Exporter → Prometheus → Grafana
+```
+
+Dashboard Grafana saat ini sudah terlihat lebih profesional karena:
+
+```text
+- Status router tampil ON/OFF
+- Uptime tampil dalam durasi
+- Traffic download/upload tampil realtime
+- Status port tampil dalam card/kotak
+- Port yang terpakai dan tidak terpakai lebih mudah dipahami orang awam
+```
+
+Tahap berikutnya adalah menyelesaikan:
+
+```text
+- CPU Load
+- Memory Usage
+- Port Aktif / Port Tidak Aktif
+- Packet Error / Packet Drop
+- Alertmanager
+- Webhook alerting
+```
+
 ## 24. Catatan Keamanan
 
 1. Jangan membuka SNMP ke internet.
