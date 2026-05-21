@@ -2,6 +2,10 @@
 
 Dokumentasi ini menjelaskan langkah teknis pembuatan project monitoring jaringan MikroTik menggunakan **Docker**, **SNMP Exporter**, **Prometheus**, **Grafana**, dan rencana lanjutan **Alertmanager + Webhook**.
 
+
+> **Update terbaru:** project sudah ditingkatkan dari sekadar dashboard monitoring menjadi sistem **monitoring + automated alerting**. Alert otomatis sekarang dapat dikirim ke **Telegram Bot** melalui alur **Prometheus Alert Rules → Alertmanager → FastAPI Webhook Receiver → Telegram Group**. Semua data runtime penting disimpan memakai **bind mount ke folder project/server**, bukan Docker named volume tersembunyi.
+
+
 Project ini dibuat untuk kebutuhan monitoring multi-router MikroTik, dimulai dari satu router MikroTik utama:
 
 ```text
@@ -3575,3 +3579,1488 @@ Alerting        : Prometheus alert rules + Alertmanager
 Webhook         : pengiriman alert otomatis ke sistem eksternal
 Docker          : deployment aman, rapi, dan mudah dipindahkan
 ```
+
+
+---
+
+# Lampiran Update Final: Automated Alerting Webhook ke Telegram Bot
+
+Bagian ini adalah dokumentasi update terbaru setelah dashboard Grafana MikroTik berhasil dibuat stabil. Pada tahap ini project tidak hanya menampilkan dashboard observability, tetapi sudah ditambah **alert otomatis**. Jika MikroTik mati, kabel tidak tercolok, SNMP timeout, atau router tidak mengirim data uptime terbaru, maka sistem akan otomatis mengirim notifikasi ke **Telegram Group**.
+
+Update ini melengkapi arsitektur awal:
+
+```text
+MikroTik
+↓ SNMP UDP 161
+SNMP Exporter
+↓ HTTP metrics
+Prometheus
+↓ alert rules
+Alertmanager
+↓ webhook POST
+FastAPI Webhook Receiver
+↓ Telegram Bot API
+Telegram Group Monitoring MikroTik
+```
+
+## 26. Tujuan Update Telegram Alerting
+
+Tujuan update ini adalah:
+
+1. Membuat monitoring tidak hanya terlihat di Grafana, tetapi juga aktif memberi peringatan.
+2. Mengirim alert otomatis ketika MikroTik mati atau tidak terdeteksi.
+3. Mengirim recovery/resolved ketika MikroTik kembali hidup.
+4. Membuat webhook receiver sendiri supaya ke depan bisa dikembangkan ke WhatsApp, email, database, atau dashboard admin.
+5. Menyimpan semua konfigurasi dan data penting di folder project/server, bukan Docker named volume tersembunyi.
+6. Membuat dokumentasi project lebih lengkap dari awal sampai alert Telegram berhasil.
+
+---
+
+## 27. Komponen Baru yang Ditambahkan
+
+Sebelumnya stack utama project adalah:
+
+```text
+snmp_exporter
+prometheus
+grafana
+```
+
+Setelah update Telegram alerting, stack menjadi:
+
+```text
+snmp_exporter
+prometheus
+grafana
+alertmanager
+webhook_receiver
+```
+
+Penjelasan komponen baru:
+
+| Komponen | Fungsi |
+|---|---|
+| Alertmanager | Menerima alert dari Prometheus, mengatur grouping, interval, repeat, dan resolved notification |
+| Webhook Receiver | Service FastAPI custom yang menerima payload Alertmanager |
+| Telegram Bot | Bot Telegram yang mengirim pesan alert ke group |
+| Telegram Group | Tempat notifikasi monitoring diterima |
+| prometheus/rules | Folder rule alert Prometheus |
+| alertmanager/alertmanager.yml | Konfigurasi routing alert ke webhook |
+| webhook-receiver/app/main.py | Source code FastAPI untuk kirim alert ke Telegram |
+
+Catatan:
+
+```text
+Webhook receiver di project ini memakai FastAPI.
+Secara fungsi mirip Flask, tetapi implementasi yang dipakai adalah FastAPI + Uvicorn.
+```
+
+---
+
+## 28. Struktur Folder Project Setelah Update Telegram
+
+Struktur folder final yang disarankan:
+
+```text
+grafana_monitoring_mikrotik/
+├── docker-compose.yml
+├── .gitignore
+├── prometheus/
+│   ├── prometheus.yml
+│   ├── data/
+│   └── rules/
+│       └── mikrotik-alerts.yml
+├── alertmanager/
+│   ├── alertmanager.yml
+│   └── data/
+├── webhook-receiver/
+│   ├── .env
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── app/
+│       └── main.py
+├── snmp-exporter/
+│   └── snmp.yml
+├── grafana/
+│   ├── data/
+│   ├── dashboards/
+│   └── provisioning/
+├── hasil/
+├── penjelasan_dari_awal.md
+└── README.md
+```
+
+Folder penting:
+
+| Folder/File | Fungsi |
+|---|---|
+| `prometheus/data/` | Data time-series Prometheus, bind mount ke folder server |
+| `prometheus/rules/` | File alert rules Prometheus |
+| `alertmanager/data/` | Data runtime Alertmanager |
+| `alertmanager/alertmanager.yml` | Routing alert ke webhook |
+| `webhook-receiver/.env` | Token bot Telegram dan chat ID |
+| `webhook-receiver/app/main.py` | Logic penerima alert dan pengirim Telegram |
+| `grafana/data/` | Database Grafana dan dashboard yang sudah dibuat |
+
+---
+
+## 29. Konsep Penyimpanan Data: Bind Mount ke Server
+
+Pada update ini, data runtime penting dibuat masuk ke folder project langsung.
+
+Konsep yang dipakai:
+
+```text
+Grafana      → ./grafana/data
+Prometheus   → ./prometheus/data
+Alertmanager → ./alertmanager/data
+```
+
+Dengan cara ini:
+
+```text
+- Data mudah dilihat di VS Code/file manager
+- Lebih aman saat pindah device
+- Mudah di-backup
+- Tidak bergantung pada Docker named volume tersembunyi
+```
+
+Folder yang perlu dibuat:
+
+```bash
+mkdir -p prometheus/data
+mkdir -p prometheus/rules
+mkdir -p alertmanager/data
+mkdir -p webhook-receiver/app
+mkdir -p grafana/data
+mkdir -p grafana/provisioning/datasources
+mkdir -p grafana/provisioning/dashboards
+mkdir -p grafana/dashboards
+```
+
+Permission yang disarankan:
+
+```bash
+sudo chown -R 65534:65534 prometheus/data
+sudo chown -R 65534:65534 alertmanager/data
+sudo chown -R 472:472 grafana/data
+```
+
+Penjelasan UID:
+
+```text
+65534 = user nobody yang umum dipakai Prometheus/Alertmanager container
+472   = user grafana di container Grafana
+```
+
+---
+
+## 30. Membuat Telegram Bot
+
+### 30.1 Buat bot melalui BotFather
+
+Buka Telegram, cari:
+
+```text
+@BotFather
+```
+
+Jalankan:
+
+```text
+/newbot
+```
+
+BotFather akan meminta:
+
+```text
+1. Nama bot
+2. Username bot yang harus berakhiran _bot
+```
+
+Contoh:
+
+```text
+Nama bot     : mikrotik_monitoring
+Username bot : djncloud_grafana_bot
+```
+
+Setelah selesai, BotFather memberikan token API dengan format seperti ini:
+
+```text
+1234567890:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+Token ini **rahasia**. Jangan commit ke GitHub dan jangan tampilkan di screenshot publik.
+
+---
+
+### 30.2 Buat Telegram Group
+
+Buat group Telegram, contoh:
+
+```text
+Monitoring MikroTik
+```
+
+Tambahkan bot ke group:
+
+```text
+@djncloud_grafana_bot
+```
+
+Kirim pesan di group:
+
+```text
+/start
+```
+
+atau:
+
+```text
+test
+```
+
+---
+
+### 30.3 Ambil Chat ID Group
+
+Gunakan API Telegram:
+
+```bash
+curl -s "https://api.telegram.org/botTOKEN_BOT_ANDA/getUpdates"
+```
+
+Jika token valid dan bot sudah menerima update, output akan berisi bagian seperti ini:
+
+```json
+"chat": {
+  "id": -5219830158,
+  "title": "Monitoring MikroTik",
+  "type": "group"
+}
+```
+
+Yang digunakan sebagai chat ID adalah:
+
+```text
+-5219830158
+```
+
+Catatan:
+
+```text
+Group ID Telegram biasanya bernilai negatif.
+Supergroup biasanya diawali -100.
+Group biasa bisa langsung negatif seperti -5219830158.
+```
+
+Jika output masih:
+
+```json
+{"ok":true,"result":[]}
+```
+
+Artinya token bot valid, tetapi bot belum menerima pesan/update. Solusinya:
+
+```text
+1. Pastikan bot sudah ditambahkan ke group.
+2. Kirim /start atau pesan test di group.
+3. Jalankan ulang getUpdates.
+```
+
+Jika muncul:
+
+```json
+{"ok":false,"error_code":404,"description":"Not Found"}
+```
+
+Biasanya URL salah. Format yang benar harus ada kata `bot` sebelum token:
+
+```bash
+curl -s "https://api.telegram.org/botTOKEN_BOT_ANDA/getUpdates"
+```
+
+Bukan:
+
+```bash
+curl -s "https://api.telegram.org/TOKEN_BOT_ANDA/getUpdates"
+```
+
+---
+
+## 31. File Environment Telegram
+
+Buat file:
+
+```bash
+nano webhook-receiver/.env
+```
+
+Isi:
+
+```env
+TELEGRAM_BOT_TOKEN=ISI_TOKEN_BOT_ANDA
+TELEGRAM_CHAT_ID=ISI_CHAT_ID_GROUP_ANDA
+TZ=Asia/Jakarta
+```
+
+Contoh struktur:
+
+```env
+TELEGRAM_BOT_TOKEN=1234567890:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TELEGRAM_CHAT_ID=-5219830158
+TZ=Asia/Jakarta
+```
+
+Penting:
+
+```text
+Jangan commit webhook-receiver/.env ke GitHub.
+```
+
+Tambahkan ke `.gitignore`:
+
+```gitignore
+webhook-receiver/.env
+.env
+grafana/data/
+prometheus/data/
+alertmanager/data/
+```
+
+---
+
+## 32. Test Kirim Telegram Manual
+
+Sebelum membuat Alertmanager, pastikan bot bisa mengirim pesan.
+
+Jalankan:
+
+```bash
+cd ~/grafana_monitoring_mikrotik
+source webhook-receiver/.env
+
+curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+  -d "chat_id=${TELEGRAM_CHAT_ID}" \
+  -d "text=✅ Test alert Telegram dari project Grafana MikroTik berhasil"
+```
+
+Jika berhasil, group Telegram akan menerima pesan:
+
+```text
+✅ Test alert Telegram dari project Grafana MikroTik berhasil
+```
+
+Jika berhasil sampai tahap ini, artinya:
+
+```text
+Telegram Bot API → Telegram Group = BERHASIL
+```
+
+---
+
+## 33. Membuat FastAPI Webhook Receiver
+
+Webhook receiver berfungsi menerima payload dari Alertmanager, lalu menerjemahkan payload tersebut menjadi pesan Telegram yang rapi.
+
+### 33.1 File requirements.txt
+
+Buat file:
+
+```bash
+nano webhook-receiver/requirements.txt
+```
+
+Isi:
+
+```txt
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+requests==2.32.3
+```
+
+### 33.2 File Dockerfile
+
+Buat file:
+
+```bash
+nano webhook-receiver/Dockerfile
+```
+
+Isi:
+
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+### 33.3 File main.py
+
+Buat file:
+
+```bash
+nano webhook-receiver/app/main.py
+```
+
+Isi:
+
+```python
+import os
+import html
+import requests
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from fastapi import FastAPI, Request, HTTPException
+
+app = FastAPI(title="MikroTik Alert Webhook Receiver")
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TIMEZONE = os.getenv("TZ", "Asia/Jakarta")
+
+
+def esc(value) -> str:
+    return html.escape(str(value)) if value is not None else "-"
+
+
+def format_time(value: str) -> str:
+    if not value:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt.astimezone(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S WIB")
+    except Exception:
+        return value
+
+
+def send_telegram(message: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN atau TELEGRAM_CHAT_ID belum diset.")
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    response = requests.post(
+        url,
+        json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=15,
+    )
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"Telegram error: {response.status_code} - {response.text}")
+
+
+def build_message(alert: dict) -> str:
+    status = alert.get("status", "unknown").upper()
+    labels = alert.get("labels", {})
+    annotations = alert.get("annotations", {})
+
+    icon = "🚨" if status == "FIRING" else "✅" if status == "RESOLVED" else "ℹ️"
+    title = "MIKROTIK ALERT" if status == "FIRING" else "MIKROTIK RECOVERY"
+
+    return f"""
+<b>{icon} {title}</b>
+
+<b>Status</b>   : {esc(status)}
+<b>Alert</b>    : {esc(labels.get("alertname"))}
+<b>Severity</b> : {esc(labels.get("severity"))}
+<b>Instance</b> : {esc(labels.get("instance"))}
+<b>Router</b>   : {esc(labels.get("router"))}
+<b>Interface</b>: {esc(labels.get("ifName", "-"))}
+
+<b>Mulai</b>    : {esc(format_time(alert.get("startsAt", "")))}
+<b>Selesai</b>  : {esc(format_time(alert.get("endsAt", "")))}
+
+<b>Summary</b>
+{esc(annotations.get("summary"))}
+
+<b>Description</b>
+{esc(annotations.get("description"))}
+""".strip()
+
+
+@app.get("/")
+def index():
+    return {
+        "status": "ok",
+        "service": "mikrotik-webhook-receiver",
+    }
+
+
+@app.post("/webhook/alert")
+async def webhook_alert(request: Request):
+    try:
+        payload = await request.json()
+        alerts = payload.get("alerts", [])
+
+        for alert in alerts:
+            send_telegram(build_message(alert))
+
+        return {
+            "status": "ok",
+            "sent": len(alerts),
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+```
+
+Endpoint yang dibuat:
+
+| Endpoint | Fungsi |
+|---|---|
+| `GET /` | Health check webhook |
+| `POST /webhook/alert` | Menerima alert dari Alertmanager lalu mengirim ke Telegram |
+
+---
+
+## 34. Konfigurasi Alertmanager
+
+Buat file:
+
+```bash
+nano alertmanager/alertmanager.yml
+```
+
+Isi:
+
+```yaml
+global:
+  resolve_timeout: 1m
+
+route:
+  receiver: "telegram-webhook"
+  group_by:
+    - alertname
+    - instance
+    - severity
+  group_wait: 5s
+  group_interval: 30s
+  repeat_interval: 1h
+
+receivers:
+  - name: "telegram-webhook"
+    webhook_configs:
+      - url: "http://webhook_receiver:8000/webhook/alert"
+        send_resolved: true
+```
+
+Penjelasan:
+
+| Opsi | Fungsi |
+|---|---|
+| `receiver` | Tujuan pengiriman alert |
+| `group_by` | Alert dengan label sama akan dikelompokkan |
+| `group_wait` | Waktu tunggu sebelum alert pertama dikirim |
+| `group_interval` | Jarak pengiriman alert dalam group yang sama |
+| `repeat_interval` | Jarak pengulangan alert jika masalah belum selesai |
+| `send_resolved` | Mengirim pesan recovery saat alert selesai |
+
+Bagian paling penting:
+
+```yaml
+webhook_configs:
+  - url: "http://webhook_receiver:8000/webhook/alert"
+    send_resolved: true
+```
+
+Karena semua service ada di Docker Compose network yang sama, Alertmanager bisa memanggil service FastAPI dengan nama service:
+
+```text
+webhook_receiver
+```
+
+---
+
+## 35. Konfigurasi Prometheus untuk Alertmanager dan Rules
+
+Edit file:
+
+```bash
+nano prometheus/prometheus.yml
+```
+
+Tambahkan bagian ini setelah `global` dan sebelum `scrape_configs`:
+
+```yaml
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - "alertmanager:9093"
+
+rule_files:
+  - "/etc/prometheus/rules/*.yml"
+```
+
+Contoh bagian awal file:
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - "alertmanager:9093"
+
+rule_files:
+  - "/etc/prometheus/rules/*.yml"
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets:
+          - "prometheus:9090"
+```
+
+Catatan:
+
+```text
+Jangan hapus job mikrotik_snmp, mikrotik_uptime, mikrotik_cpu, dan mikrotik_memory yang sudah dibuat sebelumnya.
+```
+
+---
+
+## 36. Alert Rule: MikroTik Mati / Tidak Tercolok
+
+Buat file:
+
+```bash
+nano prometheus/rules/mikrotik-alerts.yml
+```
+
+Isi:
+
+```yaml
+groups:
+  - name: mikrotik-alerts
+    interval: 5s
+    rules:
+      - alert: MikroTikRouterDown
+        expr: |
+          (
+            up{job="mikrotik_uptime"} == 0
+          )
+          or
+          (
+            snmp_error{job="mikrotik_uptime"} == 1
+          )
+          or
+          (
+            time() - timestamp(mikrotik_sys_uptime_seconds{job="mikrotik_uptime"}) > 10
+          )
+        for: 10s
+        labels:
+          severity: critical
+          router: mikrotik_hap_lite
+        annotations:
+          summary: "MikroTik tidak terdeteksi"
+          description: "Router {{ $labels.instance }} tidak terdeteksi oleh monitoring. Kemungkinan MikroTik mati, kabel terlepas, SNMP timeout, atau koneksi ke router terputus."
+```
+
+Penjelasan kondisi:
+
+| Kondisi | Arti |
+|---|---|
+| `up{job="mikrotik_uptime"} == 0` | Prometheus gagal scrape job uptime |
+| `snmp_error{job="mikrotik_uptime"} == 1` | SNMP Exporter hidup, tetapi gagal membaca MikroTik |
+| `time() - timestamp(mikrotik_sys_uptime_seconds) > 10` | Data uptime MikroTik sudah tidak fresh |
+| `for: 10s` | Alert baru dikirim jika kondisi terjadi terus selama 10 detik |
+
+Dengan konfigurasi ini, jika MikroTik mati atau kabel dicabut, alert biasanya masuk ke Telegram sekitar:
+
+```text
+15 sampai 30 detik
+```
+
+Tergantung kondisi jaringan, interval scrape, dan group_wait Alertmanager.
+
+---
+
+## 37. Docker Compose Final Tanpa Named Volume
+
+File utama:
+
+```bash
+nano docker-compose.yml
+```
+
+Isi final:
+
+```yaml
+services:
+  snmp_exporter:
+    image: prom/snmp-exporter:latest
+    container_name: mikrotik_snmp_exporter
+    restart: unless-stopped
+    ports:
+      - "9116:9116"
+    volumes:
+      - ./snmp-exporter/snmp.yml:/etc/snmp_exporter/snmp.yml:ro
+
+  webhook_receiver:
+    build:
+      context: ./webhook-receiver
+      dockerfile: Dockerfile
+    container_name: mikrotik_webhook_receiver
+    restart: unless-stopped
+    env_file:
+      - ./webhook-receiver/.env
+    ports:
+      - "8000:8000"
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: mikrotik_alertmanager
+    restart: unless-stopped
+    ports:
+      - "9093:9093"
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ./alertmanager/data:/alertmanager
+    depends_on:
+      - webhook_receiver
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: mikrotik_prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - ./prometheus/data:/prometheus
+    depends_on:
+      - snmp_exporter
+      - alertmanager
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: mikrotik_grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin12345
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+```
+
+Catatan:
+
+```text
+Tidak ada blok volumes: di bagian bawah.
+Semua data masuk ke folder project/server.
+```
+
+---
+
+## 38. Menjalankan Stack Setelah Update
+
+Dari folder root project:
+
+```bash
+cd ~/grafana_monitoring_mikrotik
+docker compose down
+docker compose up -d --build
+```
+
+Cek container:
+
+```bash
+docker ps
+```
+
+Container yang diharapkan aktif:
+
+```text
+mikrotik_snmp_exporter
+mikrotik_webhook_receiver
+mikrotik_alertmanager
+mikrotik_prometheus
+mikrotik_grafana
+```
+
+Cek log:
+
+```bash
+docker logs mikrotik_webhook_receiver --tail=100
+docker logs mikrotik_alertmanager --tail=100
+docker logs mikrotik_prometheus --tail=100
+```
+
+---
+
+## 39. Validasi Konfigurasi Prometheus dan Rules
+
+Cek konfigurasi Prometheus:
+
+```bash
+docker exec -it mikrotik_prometheus promtool check config /etc/prometheus/prometheus.yml
+```
+
+Cek alert rules:
+
+```bash
+docker exec -it mikrotik_prometheus promtool check rules /etc/prometheus/rules/mikrotik-alerts.yml
+```
+
+Jika berhasil, output akan menunjukkan bahwa file valid.
+
+Jika Prometheus restart terus, cek:
+
+```bash
+docker logs mikrotik_prometheus --tail=100
+```
+
+Penyebab umum:
+
+```text
+- YAML indent salah
+- job_name dobel
+- alert rule salah syntax
+- folder rules belum ke-mount
+- file prometheus.yml belum memiliki rule_files
+```
+
+---
+
+## 40. Test Webhook Receiver
+
+Cek service FastAPI:
+
+```bash
+curl http://localhost:8000
+```
+
+Output yang diharapkan:
+
+```json
+{"status":"ok","service":"mikrotik-webhook-receiver"}
+```
+
+Test manual webhook ke Telegram:
+
+```bash
+curl -X POST http://localhost:8000/webhook/alert \
+  -H "Content-Type: application/json" \
+  -d '{
+    "alerts": [
+      {
+        "status": "firing",
+        "labels": {
+          "alertname": "TestWebhook",
+          "severity": "info",
+          "instance": "192.168.88.1",
+          "router": "mikrotik_hap_lite"
+        },
+        "annotations": {
+          "summary": "Test webhook berhasil",
+          "description": "Ini test dari FastAPI webhook ke Telegram."
+        },
+        "startsAt": "2026-05-21T04:00:00Z",
+        "endsAt": ""
+      }
+    ]
+  }'
+```
+
+Jika masuk ke group Telegram, artinya:
+
+```text
+FastAPI Webhook Receiver → Telegram = BERHASIL
+```
+
+---
+
+## 41. Test Alertmanager ke Telegram
+
+Test dari Alertmanager:
+
+```bash
+curl -X POST http://localhost:9093/api/v2/alerts \
+  -H "Content-Type: application/json" \
+  -d '[
+    {
+      "labels": {
+        "alertname": "TestFromAlertmanager",
+        "severity": "critical",
+        "instance": "192.168.88.1",
+        "router": "mikrotik_hap_lite"
+      },
+      "annotations": {
+        "summary": "Test dari Alertmanager",
+        "description": "Kalau pesan ini masuk Telegram, berarti Alertmanager ke Webhook ke Telegram berhasil."
+      },
+      "startsAt": "2026-05-21T04:00:00Z"
+    }
+  ]'
+```
+
+Tunggu beberapa detik sesuai `group_wait`.
+
+Jika masuk ke Telegram, artinya:
+
+```text
+Alertmanager → FastAPI Webhook Receiver → Telegram = BERHASIL
+```
+
+---
+
+## 42. Test Real MikroTik Mati / Kabel Dicabut
+
+Setelah semua test manual berhasil, lakukan test real.
+
+Langkah:
+
+```text
+1. Pastikan dashboard Grafana menunjukkan router ON.
+2. Pastikan target Prometheus UP.
+3. Cabut kabel MikroTik, matikan MikroTik, atau putus koneksi ke router.
+4. Tunggu sekitar 15 sampai 30 detik.
+5. Telegram harus menerima alert MikroTikRouterDown.
+6. Colok kembali MikroTik.
+7. Tunggu beberapa detik.
+8. Telegram harus menerima recovery/resolved.
+```
+
+Cek halaman Prometheus Alerts:
+
+```text
+http://localhost:9090/alerts
+```
+
+Cek Alertmanager:
+
+```text
+http://localhost:9093
+```
+
+Status alert:
+
+| Status | Arti |
+|---|---|
+| Inactive | Kondisi alert tidak terjadi |
+| Pending | Kondisi terjadi, tetapi belum melewati durasi `for` |
+| Firing | Alert aktif dan akan dikirim ke Alertmanager |
+| Resolved | Kondisi sudah normal kembali |
+
+---
+
+## 43. Format Pesan Telegram
+
+Contoh alert ketika MikroTik mati:
+
+```text
+🚨 MIKROTIK ALERT
+
+Status   : FIRING
+Alert    : MikroTikRouterDown
+Severity : critical
+Instance : 192.168.88.1
+Router   : mikrotik_hap_lite
+Interface: -
+
+Mulai    : 2026-05-21 11:45:00 WIB
+Selesai  : -
+
+Summary
+MikroTik tidak terdeteksi
+
+Description
+Router 192.168.88.1 tidak terdeteksi oleh monitoring. Kemungkinan MikroTik mati, kabel terlepas, SNMP timeout, atau koneksi ke router terputus.
+```
+
+Contoh recovery:
+
+```text
+✅ MIKROTIK RECOVERY
+
+Status   : RESOLVED
+Alert    : MikroTikRouterDown
+Severity : critical
+Instance : 192.168.88.1
+Router   : mikrotik_hap_lite
+Interface: -
+
+Mulai    : 2026-05-21 11:45:00 WIB
+Selesai  : 2026-05-21 11:47:00 WIB
+
+Summary
+MikroTik tidak terdeteksi
+
+Description
+Router 192.168.88.1 tidak terdeteksi oleh monitoring. Kemungkinan MikroTik mati, kabel terlepas, SNMP timeout, atau koneksi ke router terputus.
+```
+
+---
+
+## 44. Troubleshooting Telegram Alerting
+
+### 44.1 getUpdates result kosong
+
+Gejala:
+
+```json
+{"ok":true,"result":[]}
+```
+
+Penyebab:
+
+```text
+Token benar, tetapi bot belum menerima pesan/update.
+```
+
+Solusi:
+
+```text
+1. Tambahkan bot ke group.
+2. Kirim /start atau pesan test di group.
+3. Jalankan getUpdates lagi.
+```
+
+---
+
+### 44.2 Telegram API 404 Not Found
+
+Gejala:
+
+```json
+{"ok":false,"error_code":404,"description":"Not Found"}
+```
+
+Penyebab umum:
+
+```text
+URL salah karena lupa kata bot sebelum token.
+```
+
+Benar:
+
+```bash
+curl -s "https://api.telegram.org/botTOKEN_BOT_ANDA/getUpdates"
+```
+
+Salah:
+
+```bash
+curl -s "https://api.telegram.org/TOKEN_BOT_ANDA/getUpdates"
+```
+
+---
+
+### 44.3 Webhook receiver tidak jalan
+
+Cek:
+
+```bash
+docker ps | grep webhook
+docker logs mikrotik_webhook_receiver --tail=100
+```
+
+Test:
+
+```bash
+curl http://localhost:8000
+```
+
+Jika gagal, cek:
+
+```text
+- Dockerfile benar
+- requirements.txt benar
+- webhook-receiver/app/main.py ada
+- env_file di docker-compose.yml mengarah ke ./webhook-receiver/.env
+- token dan chat ID di .env benar
+```
+
+---
+
+### 44.4 Alert muncul di Prometheus tetapi tidak masuk Telegram
+
+Cek urutan pipeline:
+
+```text
+Prometheus alert FIRING
+↓
+Alertmanager menerima alert
+↓
+Alertmanager POST ke webhook_receiver
+↓
+Webhook receiver kirim ke Telegram
+```
+
+Cek log:
+
+```bash
+docker logs mikrotik_alertmanager --tail=100
+docker logs mikrotik_webhook_receiver --tail=100
+```
+
+Cek konfigurasi Alertmanager:
+
+```yaml
+webhook_configs:
+  - url: "http://webhook_receiver:8000/webhook/alert"
+    send_resolved: true
+```
+
+Pastikan nama service di docker-compose adalah:
+
+```yaml
+webhook_receiver:
+```
+
+---
+
+### 44.5 Prometheus tidak membaca rules
+
+Cek `prometheus.yml`:
+
+```yaml
+rule_files:
+  - "/etc/prometheus/rules/*.yml"
+```
+
+Cek docker-compose service Prometheus:
+
+```yaml
+volumes:
+  - ./prometheus/rules:/etc/prometheus/rules:ro
+```
+
+Cek rules di container:
+
+```bash
+docker exec -it mikrotik_prometheus ls -lah /etc/prometheus/rules
+```
+
+Validasi:
+
+```bash
+docker exec -it mikrotik_prometheus promtool check rules /etc/prometheus/rules/mikrotik-alerts.yml
+```
+
+---
+
+### 44.6 Alert tidak cepat masuk
+
+Cek beberapa parameter ini:
+
+```yaml
+groups:
+  - name: mikrotik-alerts
+    interval: 5s
+```
+
+```yaml
+for: 10s
+```
+
+```yaml
+group_wait: 5s
+```
+
+Estimasi waktu alert:
+
+```text
+rule interval 5s + for 10s + group_wait 5s = sekitar 20 detik
+```
+
+Jika ingin lebih cepat, bisa kecilkan `for`, tetapi jangan terlalu kecil agar tidak banyak false alarm.
+
+Rekomendasi stabil:
+
+```yaml
+for: 10s
+```
+
+atau:
+
+```yaml
+for: 15s
+```
+
+---
+
+## 45. Catatan Keamanan Token Telegram
+
+Token Telegram Bot adalah rahasia.
+
+Hal yang wajib dilakukan:
+
+```text
+- Jangan commit token ke GitHub
+- Jangan upload screenshot token
+- Jangan tulis token asli di README publik
+- Simpan token hanya di webhook-receiver/.env
+- Masukkan webhook-receiver/.env ke .gitignore
+```
+
+Jika token sudah pernah terlihat di screenshot/chat publik, lakukan revoke:
+
+```text
+BotFather
+→ /mybots
+→ pilih bot
+→ API Token
+→ Revoke current token
+→ Generate new token
+```
+
+Setelah token baru dibuat:
+
+```bash
+nano webhook-receiver/.env
+docker compose restart webhook_receiver
+```
+
+---
+
+## 46. Perintah Harian Setelah Ada Telegram Alerting
+
+Masuk folder project:
+
+```bash
+cd ~/grafana_monitoring_mikrotik
+```
+
+Jalankan semua service:
+
+```bash
+docker compose up -d --build
+```
+
+Stop semua service:
+
+```bash
+docker compose down
+```
+
+Restart service tertentu:
+
+```bash
+docker compose restart prometheus
+docker compose restart alertmanager
+docker compose restart webhook_receiver
+docker compose restart grafana
+```
+
+Cek container:
+
+```bash
+docker ps
+```
+
+Cek log utama:
+
+```bash
+docker logs mikrotik_prometheus --tail=100
+docker logs mikrotik_alertmanager --tail=100
+docker logs mikrotik_webhook_receiver --tail=100
+docker logs mikrotik_grafana --tail=100
+docker logs mikrotik_snmp_exporter --tail=100
+```
+
+Cek endpoint:
+
+```bash
+curl http://localhost:8000
+curl http://localhost:9090/-/ready
+curl http://localhost:9093/-/ready
+```
+
+Cek Prometheus:
+
+```text
+http://localhost:9090/targets
+http://localhost:9090/alerts
+```
+
+Cek Alertmanager:
+
+```text
+http://localhost:9093
+```
+
+Cek Grafana:
+
+```text
+http://localhost:3000
+```
+
+---
+
+## 47. Status Final Setelah Telegram Alerting Berhasil
+
+Status akhir project setelah update:
+
+```text
+SNMP MikroTik                   : BERHASIL
+SNMP Exporter                   : BERHASIL
+Prometheus scrape metrics        : BERHASIL
+Grafana dashboard realtime       : BERHASIL
+Grafana data bind mount          : BERHASIL
+Prometheus data bind mount       : BERHASIL
+Alertmanager data bind mount     : BERHASIL
+Telegram Bot created             : BERHASIL
+Telegram chat ID didapat         : BERHASIL
+Manual Telegram sendMessage      : BERHASIL
+FastAPI Webhook Receiver         : BERHASIL
+Alertmanager webhook route       : BERHASIL
+Prometheus alert rule            : BERHASIL
+MikroTik down alert ke Telegram  : BERHASIL
+```
+
+Dengan update ini, project sudah menjadi:
+
+```text
+Dashboard Observability Multi-Router MikroTik
+Berbasis Prometheus, Grafana, dan Automated Alerting Webhook Telegram
+```
+
+Project ini sudah mencakup:
+
+```text
+1. Monitoring metrics router
+2. Visualisasi dashboard profesional
+3. Data runtime portable di folder server
+4. Alert otomatis jika router bermasalah
+5. Notifikasi Telegram realtime
+6. Fondasi untuk pengembangan multi-router dan multi-channel alert
+```
+
+---
+
+## 48. Rekomendasi Pengembangan Lanjutan
+
+Setelah Telegram alerting berhasil, pengembangan berikutnya yang bisa ditambahkan:
+
+```text
+1. Alert interface penting down, misalnya ether1.
+2. Alert CPU tinggi.
+3. Alert memory tinggi.
+4. Alert packet drop/error tinggi.
+5. Alert reboot detected dari perubahan uptime.
+6. Simpan log alert ke SQLite/PostgreSQL/MariaDB.
+7. Buat dashboard khusus riwayat alert.
+8. Tambahkan multi-router dengan label router dan location.
+9. Tambahkan notification channel lain seperti email atau WhatsApp.
+10. Tambahkan Cloudflare Access untuk Grafana agar lebih aman.
+```
+
+Contoh alert interface down:
+
+```yaml
+- alert: MikroTikEther1Down
+  expr: |
+    (
+      ifOperStatus{job="mikrotik_snmp", ifName="ether1"} == 2
+    )
+    and on(instance)
+    (
+      max by(instance) (
+        (time() - timestamp(mikrotik_sys_uptime_seconds{job="mikrotik_uptime"})) < bool 15
+      ) == 1
+    )
+  for: 30s
+  labels:
+    severity: warning
+    router: mikrotik_hap_lite
+  annotations:
+    summary: "Interface ether1 DOWN"
+    description: "Interface {{ $labels.ifName }} pada router {{ $labels.instance }} sedang DOWN atau link tidak terhubung."
+```
+
+Contoh alert CPU tinggi:
+
+```yaml
+- alert: MikroTikHighCPU
+  expr: |
+    avg by(instance) (
+      mikrotik_cpu_load_percent{job="mikrotik_cpu"}
+    ) > 80
+  for: 2m
+  labels:
+    severity: warning
+    router: mikrotik_hap_lite
+  annotations:
+    summary: "CPU MikroTik tinggi"
+    description: "CPU router {{ $labels.instance }} berada di atas 80% selama lebih dari 2 menit."
+```
+
+---
+
+## 49. Kesimpulan Update Telegram Bot
+
+Update Telegram Bot ini membuat project menjadi jauh lebih berguna secara operasional.
+
+Sebelumnya:
+
+```text
+Admin harus membuka Grafana untuk melihat apakah router bermasalah.
+```
+
+Setelah update:
+
+```text
+Sistem akan otomatis memberi tahu ke Telegram ketika MikroTik mati, kabel terlepas, SNMP timeout, atau router tidak terdeteksi.
+```
+
+Alur final:
+
+```text
+MikroTik
+↓
+SNMP Exporter
+↓
+Prometheus
+↓
+Alertmanager
+↓
+FastAPI Webhook Receiver
+↓
+Telegram Bot
+↓
+Group Monitoring MikroTik
+```
+
+Dengan begitu, project ini sudah layak disebut sebagai:
+
+```text
+Sistem Observability MikroTik dengan Dashboard Realtime dan Automated Telegram Alerting
+```
+
