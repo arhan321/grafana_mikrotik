@@ -34,6 +34,8 @@ scrape_configs:
         replacement: snmp_exporter:9116
 
   - job_name: "mikrotik_uptime"
+    scrape_interval: 2s
+    scrape_timeout: 1s
     metrics_path: /snmp
     params:
       module:
