@@ -1,0 +1,24 @@
+groups:
+  - name: mikrotik-alerts
+    interval: 5s
+    rules:
+      - alert: MikroTikRouterDown
+        expr: |
+          (
+            up{job="mikrotik_uptime"} == 0
+          )
+          or
+          (
+            snmp_error{job="mikrotik_uptime"} == 1
+          )
+          or
+          (
+            time() - timestamp(mikrotik_sys_uptime_seconds{job="mikrotik_uptime"}) > 10
+          )
+        for: 10s
+        labels:
+          severity: critical
+          router: mikrotik_hap_lite
+        annotations:
+          summary: "MikroTik tidak terdeteksi"
+          description: "Router {{ $labels.instance }} tidak terdeteksi oleh monitoring. Kemungkinan MikroTik mati, kabel terlepas, SNMP timeout, atau koneksi ke router terputus."

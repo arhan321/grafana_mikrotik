@@ -8,6 +8,32 @@ services:
     volumes:
       - ./snmp-exporter/snmp.yml:/etc/snmp_exporter/snmp.yml:ro
 
+  webhook_receiver:
+    build:
+      context: ./webhook-receiver
+      dockerfile: Dockerfile
+    container_name: mikrotik_webhook_receiver
+    restart: unless-stopped
+    env_file:
+      - ./webhook-receiver/.env
+    ports:
+      - "8000:8000"
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: mikrotik_alertmanager
+    restart: unless-stopped
+    ports:
+      - "9093:9093"
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ./alertmanager/data:/alertmanager
+    depends_on:
+      - webhook_receiver
+
   prometheus:
     image: prom/prometheus:latest
     container_name: mikrotik_prometheus
@@ -16,12 +42,15 @@ services:
       - "9090:9090"
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
       - "--storage.tsdb.retention.time=30d"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - ./prometheus/data:/prometheus
     depends_on:
       - snmp_exporter
+      - alertmanager
 
   grafana:
     image: grafana/grafana:latest
@@ -39,7 +68,3 @@ services:
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
-
-volumes:
-  prometheus_data:
-  grafana_data:
