@@ -1,0 +1,18 @@
+{
+	"ulid": "01KS5GT361CM5D0WD0MPTGQ7VA",
+	"minTime": 1779364800388,
+	"maxTime": 1779372000000,
+	"stats": {
+		"numSamples": 539760,
+		"numFloatSamples": 539760,
+		"numSeries": 1078,
+		"numChunks": 4501
+	},
+	"compaction": {
+		"level": 1,
+		"sources": [
+			"01KS5GT361CM5D0WD0MPTGQ7VA"
+		]
+	},
+	"version": 1
+}

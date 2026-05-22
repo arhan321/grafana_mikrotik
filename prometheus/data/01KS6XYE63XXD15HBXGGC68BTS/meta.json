@@ -1,0 +1,18 @@
+{
+	"ulid": "01KS6XYE63XXD15HBXGGC68BTS",
+	"minTime": 1779386443540,
+	"maxTime": 1779393600000,
+	"stats": {
+		"numSamples": 178800,
+		"numFloatSamples": 178800,
+		"numSeries": 1078,
+		"numChunks": 2222
+	},
+	"compaction": {
+		"level": 1,
+		"sources": [
+			"01KS6XYE63XXD15HBXGGC68BTS"
+		]
+	},
+	"version": 1
+}

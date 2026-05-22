@@ -1,0 +1,18 @@
+{
+	"ulid": "01KS5V527ERS2SW11X4NAP0M44",
+	"minTime": 1779372000388,
+	"maxTime": 1779379200000,
+	"stats": {
+		"numSamples": 539760,
+		"numFloatSamples": 539760,
+		"numSeries": 1078,
+		"numChunks": 4501
+	},
+	"compaction": {
+		"level": 1,
+		"sources": [
+			"01KS5V527ERS2SW11X4NAP0M44"
+		]
+	},
+	"version": 1
+}
